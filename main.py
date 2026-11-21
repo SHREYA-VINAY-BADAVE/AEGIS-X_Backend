@@ -1,10 +1,10 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from backend.config.settings import settings
-from backend.database.connection import get_database, initialize_database
+from backend.database.connection import close_database, get_database, verify_database_connection
 from backend.utils.security import hash_password
 from backend.routes.auth import router as auth_router
 from backend.routes.scan import router as scan_router
@@ -31,7 +31,44 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_origin_regex=r"chrome-extension://.*",
 )
+
+_live_clients: dict[WebSocket, str] = {}
+
+@app.websocket("/api/live")
+async def live_updates(websocket: WebSocket):
+    from backend.utils.security import decode_access_token
+    token = websocket.query_params.get("token", "")
+    payload = decode_access_token(token) if token else None
+    user = await get_database().users.find_one({"email": (payload or {}).get("sub")}) if payload else None
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    _live_clients[websocket] = str(user.get("_id", ""))
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _live_clients.pop(websocket, None)
+
+async def broadcast_scan(scan: dict):
+    message = {"type": "scan", "scan": {
+        "_id": scan.get("_id"), "url": scan.get("url"),
+        "prediction": scan.get("prediction"), "risk_score": scan.get("risk_score"),
+        "scan_time": scan.get("scan_time").isoformat() if hasattr(scan.get("scan_time"), "isoformat") else scan.get("scan_time"),
+    }}
+    stale = []
+    for client, user_id in tuple(_live_clients.items()):
+        if user_id != str(scan.get("user_id", "")):
+            continue
+        try:
+            await client.send_json(message)
+        except Exception:
+            stale.append(client)
+    for client in stale:
+        _live_clients.pop(client, None)
 
 # ── IP-forwarding middleware ────────────────────────────────────────
 @app.middleware("http")
@@ -70,25 +107,13 @@ async def seed_admin():
 
 @app.on_event("startup")
 async def startup_db_client():
-    from backend.database import connection
-    initialize_database()
-    # Verify database connection asynchronously if not using mock db
-    if not connection.use_mock_db and connection.db is not None:
-        try:
-            # We try to ping the server to ensure we can connect
-            await connection.db.client.server_info()
-            logger.info("Successfully connected to real MongoDB instance.")
-        except Exception as e:
-            logger.warning(f"Failed to connect to MongoDB: {e}. Falling back to mongomock.")
-            import mongomock
-            from backend.database.connection import MockAsyncDatabase
-            mock_client = mongomock.MongoClient()
-            sync_db = mock_client[settings.DATABASE_NAME]
-            connection.db = MockAsyncDatabase(sync_db)
-            connection.use_mock_db = True
-            logger.info("Mock Database loaded successfully.")
+    await verify_database_connection()
     await seed_admin()
     logger.info("FastAPI application startup sequence completed.")
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    await close_database()
 
 @app.get("/")
 def read_root():

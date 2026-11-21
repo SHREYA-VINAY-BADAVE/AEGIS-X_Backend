@@ -1,11 +1,12 @@
 import os
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Intelligent Phishing Detection Using Machine Learning"
     
     # MongoDB settings
-    MONGODB_URI: str = "mongodb+srv://abhijeetbirajdar90_db_user:<db_password>@cluster0.ohr9qor.mongodb.net/?appName=Cluster0"
+    MONGODB_URI: str = Field(..., min_length=1)
     DATABASE_NAME: str = "phishing_detection"
     
     # JWT authentication settings

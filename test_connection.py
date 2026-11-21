@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from backend.config.settings import settings
-from backend.database.connection import get_database, initialize_database
+from backend.database.connection import get_database
 from backend.database import connection
 
 logging.basicConfig(level=logging.INFO)
@@ -9,29 +9,26 @@ logger = logging.getLogger("TestConnection")
 
 async def run_test():
     logger.info("Starting connection test...")
-    logger.info(f"Loaded database URI: {settings.MONGODB_URI}")
-    logger.info(f"Loaded database name: {settings.DATABASE_NAME}")
+    logger.info("Loaded MongoDB configuration for database %s.", settings.DATABASE_NAME)
 
     # Initialize connection
-    initialize_database()
+    await connection.verify_database_connection()
     db = get_database()
 
-    if connection.use_mock_db:
-        logger.error("Database connection fell back to MOCK DATABASE. Real MongoDB Atlas connection failed.")
-        return False
-
     try:
-        # 1. Check server info
-        server_info = await db.client.server_info()
-        logger.info(f"Successfully pinged MongoDB Atlas. Server Info: {server_info.get('version', 'unknown version')}")
+        # 1. Check server connectivity
+        await db.command("ping")
+        logger.info("Successfully pinged configured MongoDB deployment.")
 
         # 2. Test Write operation
-        test_doc = {"name": "test_connection", "data": 12345}
+        from uuid import uuid4
+        test_name = f"test_connection_{uuid4().hex}"
+        test_doc = {"name": test_name, "data": 12345}
         insert_result = await db.test_connection_temp.insert_one(test_doc)
-        logger.info(f"Insert test successful. Inserted ID: {insert_result.inserted_id}")
+        logger.info("Insert test successful. Inserted ID: %s", insert_result.inserted_id)
 
         # 3. Test Read operation
-        found_doc = await db.test_connection_temp.find_one({"name": "test_connection"})
+        found_doc = await db.test_connection_temp.find_one({"_id": insert_result.inserted_id})
         if found_doc:
             logger.info("Read test successful.")
         else:
@@ -39,7 +36,7 @@ async def run_test():
             return False
 
         # 4. Test Delete operation
-        delete_result = await db.test_connection_temp.delete_one({"name": "test_connection"})
+        delete_result = await db.test_connection_temp.delete_one({"_id": insert_result.inserted_id})
         if delete_result.deleted_count > 0:
             logger.info("Delete test successful. Temporary test document deleted.")
         else:

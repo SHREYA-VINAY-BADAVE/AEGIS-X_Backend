@@ -1,8 +1,13 @@
 import os
 import socket
 import pickle
+import time
+import ipaddress
+import asyncio
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, HttpUrl
 from bson import ObjectId
 from backend.database.connection import get_database
@@ -27,6 +32,45 @@ from backend.services.behavior_analytics import record_scan_behavior
 from backend.routes.incidents import auto_create_incident
 
 router = APIRouter(prefix="/scan", tags=["scan"])
+_extension_requests: dict[str, list[float]] = {}
+_SENSITIVE_QUERY_KEYS = {"token", "access_token", "auth", "authorization", "session", "sessionid", "sid", "password", "passwd", "secret", "code", "reset_token", "refresh_token", "id_token", "credential"}
+
+def _safe_scan_url(raw_url: str) -> str:
+    raw_url = raw_url.strip()
+    if len(raw_url) > 4096:
+        raise HTTPException(status_code=422, detail="URL is too long.")
+    if not raw_url.startswith(("http://", "https://")):
+        raw_url = "https://" + raw_url
+    try:
+        parts = urlsplit(raw_url)
+        host = parts.hostname
+        if parts.scheme not in {"http", "https"} or not host or parts.username or parts.password:
+            raise ValueError()
+        # Reject local/private literal IPs. Hostnames continue through the existing scan workflow.
+        try:
+            address = ipaddress.ip_address(host)
+            if not address.is_global:
+                raise HTTPException(status_code=422, detail="Private or local addresses cannot be scanned.")
+        except ValueError:
+            pass
+        host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        # Prevent hostname based requests to loopback, private networks and link-local services.
+        try:
+            resolved = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+            if not resolved or any(not address.is_global for address in resolved):
+                raise HTTPException(status_code=422, detail="Private or local destinations cannot be scanned.")
+        except socket.gaierror:
+            raise HTTPException(status_code=422, detail="The domain does not resolve.")
+        port = parts.port
+        netloc = f"[{host}]" if ":" in host else host
+        if port and not ((parts.scheme == "https" and port == 443) or (parts.scheme == "http" and port == 80)):
+            netloc += f":{port}"
+        query = urlencode([(k, "[REDACTED]" if k.lower() in _SENSITIVE_QUERY_KEYS else v) for k, v in parse_qsl(parts.query, keep_blank_values=True)])
+        return urlunsplit((parts.scheme.lower(), netloc, parts.path or "/", query, ""))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid HTTP or HTTPS URL.")
 
 # Lazy loader for ML assets
 _model = None
@@ -63,6 +107,21 @@ def get_ml_assets():
 class ScanRequest(BaseModel):
     url: str
 
+@router.post("/browser")
+async def scan_browser_url(request: ScanRequest, current_user: dict = Depends(get_current_user)):
+    """Extension entry point; shares the existing model, threat checks and persistence."""
+    now = time.monotonic()
+    key = str(current_user["_id"])
+    recent = [stamp for stamp in _extension_requests.get(key, []) if now - stamp < 60]
+    if len(recent) >= 30:
+        raise HTTPException(status_code=429, detail="Browser scan rate limit reached. Try again shortly.")
+    recent.append(now)
+    _extension_requests[key] = recent
+    url = await run_in_threadpool(_safe_scan_url, request.url)
+    result = await scan_url(ScanRequest(url=url), current_user)
+    result["source"] = "browser"
+    return result
+
 # Feature list mapping
 FEATURES_LIST = [
     "url_length", "domain_length", "https_status", "num_dots", "num_hyphens",
@@ -89,7 +148,7 @@ async def scan_url(request: ScanRequest, current_user: dict = Depends(get_curren
     is_mock = "aegis-x-mock" in hostname or hostname == "localhost" or hostname == "127.0.0.1"
     if not is_mock:
         try:
-            socket.gethostbyname(hostname)
+            await run_in_threadpool(socket.gethostbyname, hostname)
         except socket.gaierror:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -97,11 +156,11 @@ async def scan_url(request: ScanRequest, current_user: dict = Depends(get_curren
             )
             
     db = get_database()
-    model, explainer = get_ml_assets()
+    model, explainer = await run_in_threadpool(get_ml_assets)
     
     # 1. Feature extraction
     try:
-        features = extract_features(url, check_redirects=True)
+        features = await run_in_threadpool(extract_features, url, check_redirects=True)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -113,7 +172,8 @@ async def scan_url(request: ScanRequest, current_user: dict = Depends(get_curren
     
     # 2. Prediction & Risk Score
     try:
-        proba = model.predict_proba([vector])[0][1]  # Phishing probability
+        probabilities = await run_in_threadpool(model.predict_proba, [vector])
+        proba = probabilities[0][1]  # Phishing probability
         pred = 1 if proba >= 0.5 else 0
     except Exception as e:
         raise HTTPException(
@@ -123,18 +183,20 @@ async def scan_url(request: ScanRequest, current_user: dict = Depends(get_curren
         
     # 3. SHAP local explainability
     try:
-        shap_values = explainer.explain(vector)
+        shap_values = await run_in_threadpool(explainer.explain, vector)
         shap_dict = {FEATURES_LIST[i]: float(shap_values[i]) for i in range(len(FEATURES_LIST))}
     except Exception as e:
         shap_dict = {feat: 0.0 for feat in FEATURES_LIST}
         
     # 4. Domain & Website Deep Analysis
     hostname = clean_hostname(url)
-    dns_records = get_dns_records(hostname)
-    ssl_details = get_ssl_details(hostname)
-    whois_info = get_whois_info(hostname)
-    website_analysis = analyze_website_content(url)
-    threat_intel = query_threat_intelligence(url)
+    dns_records, ssl_details, whois_info, website_analysis, threat_intel = await asyncio.gather(
+        run_in_threadpool(get_dns_records, hostname),
+        run_in_threadpool(get_ssl_details, hostname),
+        run_in_threadpool(get_whois_info, hostname),
+        run_in_threadpool(analyze_website_content, url),
+        run_in_threadpool(query_threat_intelligence, url),
+    )
     
     # 5. Adaptive Risk Scoring (NEW)
     adaptive_risk = compute_adaptive_risk_score(
@@ -244,13 +306,16 @@ async def scan_url(request: ScanRequest, current_user: dict = Depends(get_curren
         if incident:
             scan_doc["incident_id"] = incident.get("_id")
 
+    from backend.main import broadcast_scan
+    await broadcast_scan(scan_doc)
+
     return scan_doc
 
 @router.get("/history")
 async def get_scan_history(current_user: dict = Depends(get_current_user)):
     db = get_database()
-    scans_cursor = db.scans.find({"user_id": current_user["_id"]})
-    scans = await scans_cursor.to_list(100)
+    scans_cursor = db.scans.find({"user_id": current_user["_id"]}).sort("scan_time", -1)
+    scans = await scans_cursor.to_list(length=None)
     
     # Format ObjectId for response
     for s in scans:
@@ -258,8 +323,6 @@ async def get_scan_history(current_user: dict = Depends(get_current_user)):
         if "scan_time" in s and isinstance(s["scan_time"], datetime):
             s["scan_time"] = s["scan_time"].isoformat()
             
-    # Sort scans list manually by time descending
-    scans = sorted(scans, key=lambda x: x.get("scan_time", ""), reverse=True)
     return scans
 
 @router.get("/report/{scan_id}")
@@ -311,6 +374,9 @@ async def get_scan_details(scan_id: str, current_user: dict = Depends(get_curren
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Scan record not found."
         )
+
+    if scan.get("user_id") != current_user["_id"] and current_user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized to access this scan report.")
         
     # Format ObjectId for response
     scan["_id"] = str(scan["_id"])

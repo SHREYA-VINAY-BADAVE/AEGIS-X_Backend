@@ -15,10 +15,7 @@ def clean_hostname(url: str) -> str:
         url = "http://" + url
     try:
         parsed = urlparse(url)
-        host = parsed.netloc
-        if ":" in host:
-            host = host.split(":")[0]
-        return host
+        return (parsed.hostname or "").lower().rstrip(".")
     except Exception:
         return ""
 
@@ -179,7 +176,7 @@ def analyze_website_content(url: str) -> dict:
         return analysis
         
     try:
-        response = requests.get(url, timeout=3.0, headers={
+        response = requests.get(url, timeout=3.0, allow_redirects=False, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PhishingDetectionScanner/1.0"
         })
         analysis["response_status"] = response.status_code
